@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"EverythingSuckz/fsb/config"
+	"EverythingSuckz/fsb/internal/library"
 	"EverythingSuckz/fsb/internal/utils"
 
 	"github.com/celestix/gotgproto/dispatcher"
@@ -116,13 +117,25 @@ func sendLink(ctx *ext.Context, u *ext.Update) error {
 	markup := &tg.ReplyInlineMarkup{
 		Rows: []tg.KeyboardButtonRow{row},
 	}
+	// With STRM_DIR set, a video also goes into the media server's library as a link file
+	// (internal/library), and the reply says under which name, or why it could not.
+	reply := []styling.StyledTextOption{text}
+	if config.ValueOf.StrmDir != "" && library.IsVideo(file.MimeType, file.FileName) {
+		name := library.Name(file.FileName, u.EffectiveMessage.Text, messageID)
+		if listed, err := library.Add(config.ValueOf.StrmDir, file.ID, name, link); err != nil {
+			utils.Logger.Sugar().Error(err)
+			reply = append(reply, styling.Plain("\n\nNot added to the library: "+err.Error()))
+		} else {
+			reply = append(reply, styling.Plain("\n\nAdded to the library as: "), styling.Bold(listed))
+		}
+	}
 	if strings.Contains(link, "http://localhost") {
-		_, err = ctx.Reply(u, ext.ReplyTextStyledText(text), &ext.ReplyOpts{
+		_, err = ctx.Reply(u, ext.ReplyTextStyledTextArray(reply), &ext.ReplyOpts{
 			NoWebpage:        false,
 			ReplyToMessageId: u.EffectiveMessage.ID,
 		})
 	} else {
-		_, err = ctx.Reply(u, ext.ReplyTextStyledText(text), &ext.ReplyOpts{
+		_, err = ctx.Reply(u, ext.ReplyTextStyledTextArray(reply), &ext.ReplyOpts{
 			Markup:           markup,
 			NoWebpage:        false,
 			ReplyToMessageId: u.EffectiveMessage.ID,

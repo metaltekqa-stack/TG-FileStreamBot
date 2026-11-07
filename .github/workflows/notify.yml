@@ -16,6 +16,8 @@ on:
     types: [opened, pinned, closed, reopened]
 jobs:
   notify:
+    # Only the original repository has the Telegram secrets this needs; a fork skips it.
+    if: github.repository == 'EverythingSuckz/TG-FileStreamBot'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6

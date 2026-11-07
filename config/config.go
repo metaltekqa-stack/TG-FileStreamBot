@@ -50,7 +50,10 @@ type config struct {
 	UserSession    string       `envconfig:"USER_SESSION"`
 	UsePublicIP    bool         `envconfig:"USE_PUBLIC_IP" default:"false"`
 	AllowedUsers   allowedUsers `envconfig:"ALLOWED_USERS"`
-	MultiTokens    []string
+	// StrmDir is a media server's library folder (Jellyfin, Emby, Kodi): each video sent gets a
+	// .strm link file there (internal/library). Empty: no library.
+	StrmDir     string `envconfig:"STRM_DIR" default:""`
+	MultiTokens []string
 
 	// stream specific config
 	StreamConcurrency int `envconfig:"STREAM_CONCURRENCY" default:"4"`
