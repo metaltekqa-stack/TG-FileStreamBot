@@ -11,6 +11,7 @@ import (
 
 	"github.com/celestix/gotgproto"
 	"github.com/gotd/td/tg"
+	"github.com/gotd/td/tgerr"
 	"go.uber.org/zap"
 )
 
@@ -167,23 +168,35 @@ func (p *StreamPipe) prefetch() {
 	}
 }
 
-// downloadBlockWithRetry fetches a block with exponential backoff retry.
+// maxFloodWait is how long one block may wait in all when Telegram asks to slow down.
+const maxFloodWait = 60 * time.Second
+
+// downloadBlockWithRetry fetches a block with exponential backoff retry. Telegram asking to slow
+// down (FLOOD_WAIT, FLOOD_PREMIUM_WAIT) is waited out as asked, without using up a try, so a stream
+// pauses instead of ending. The last try goes over the bot's own connection, in case the
+// connections to the file's data centre are the trouble.
 func (p *StreamPipe) downloadBlockWithRetry(ctx context.Context, b blockSpec) ([]byte, error) {
 	var lastErr error
 
 	// TODO: make configurable later
 	backoff := 100 * time.Millisecond   // initial backoff = 100ms
 	const maxBackoff = 15 * time.Second // max backoff = 15s
+	retries := config.ValueOf.StreamMaxRetries
+	var floodWaited time.Duration
 
-	for attempt := 0; attempt < config.ValueOf.StreamMaxRetries; attempt++ {
+	for attempt := 0; attempt < retries; {
 		// check context before each attempt
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
 
+		api := p.api
+		if retries > 1 && attempt == retries-1 {
+			api = p.client.API()
+		}
 		attemptCtx, cancel := context.WithTimeout(ctx, time.Duration(config.ValueOf.StreamTimeoutSec)*time.Second)
 		data, err := utils.TimeFuncWithResult(p.log, "downloadBlock", func() ([]byte, error) {
-			return p.downloadBlock(attemptCtx, b)
+			return p.downloadBlock(attemptCtx, api, b)
 		})
 		cancel()
 
@@ -197,6 +210,20 @@ func (p *StreamPipe) downloadBlockWithRetry(ctx context.Context, b blockSpec) ([
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
+
+		if wait, ok := tgerr.AsFloodWait(err); ok && floodWaited+wait <= maxFloodWait {
+			floodWaited += wait
+			p.log.Info("Telegram asked to slow down, waiting", zap.Duration("wait", wait), zap.Int64("offset", b.offset))
+			select {
+			case <-time.After(wait + 200*time.Millisecond):
+				continue
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+
+		p.log.Warn("Block download failed, retrying", zap.Int64("offset", b.offset), zap.Int("attempt", attempt+1), zap.Error(err))
+		attempt++
 
 		// exponential backoff
 		select {
@@ -215,9 +242,9 @@ func (p *StreamPipe) downloadBlockWithRetry(ctx context.Context, b blockSpec) ([
 }
 
 // downloadBlock fetches a single block from Telegram.
-func (p *StreamPipe) downloadBlock(ctx context.Context, b blockSpec) ([]byte, error) {
+func (p *StreamPipe) downloadBlock(ctx context.Context, api *tg.Client, b blockSpec) ([]byte, error) {
 	p.log.Sugar().Debugf("Downloading block at offset %d (block size: %d)", b.offset, b.size)
-	res, err := p.api.UploadGetFile(ctx, &tg.UploadGetFileRequest{
+	res, err := api.UploadGetFile(ctx, &tg.UploadGetFileRequest{
 		Offset:   b.offset,
 		Limit:    int(b.size),
 		Location: p.location,
