@@ -127,7 +127,7 @@ func getStreamRoute(ctx *gin.Context) {
 	ctx.Header("Content-Disposition", fmt.Sprintf("%s; filename=\"%s\"", disposition, file.FileName))
 
 	if r.Method != "HEAD" {
-		pipe, err := stream.NewStreamPipe(ctx, worker.Client, file.Location, start, end, log)
+		pipe, err := stream.NewStreamPipe(ctx, worker.Client, file.Location, file.DCID, start, end, log)
 		if err != nil {
 			log.Error("Failed to create stream pipe", zap.Error(err))
 			return

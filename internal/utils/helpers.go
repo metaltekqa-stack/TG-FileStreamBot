@@ -83,6 +83,7 @@ func FileFromMedia(media tg.MessageMediaClass) (*types.File, error) {
 			FileName: fileName,
 			MimeType: document.MimeType,
 			ID:       document.ID,
+			DCID:     document.DCID,
 		}, nil
 	case *tg.MessageMediaPhoto:
 		photo, ok := media.Photo.AsNotEmpty()
@@ -109,6 +110,7 @@ func FileFromMedia(media tg.MessageMediaClass) (*types.File, error) {
 			FileName: fmt.Sprintf("photo_%d.jpg", photo.GetID()),
 			MimeType: "image/jpeg",
 			ID:       photo.GetID(),
+			DCID:     photo.DCID,
 		}, nil
 	}
 	return nil, fmt.Errorf("unexpected type %T", media)

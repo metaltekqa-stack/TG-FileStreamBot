@@ -15,6 +15,9 @@ type File struct {
 	FileName string
 	MimeType string
 	ID       int64
+	// DCID is the Telegram data centre the file is stored in (0: not known), so its blocks can be
+	// fetched over connections straight to it (stream.apiFor).
+	DCID int
 }
 
 type HashableFileStruct struct {

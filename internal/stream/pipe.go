@@ -40,6 +40,7 @@ type StreamPipe struct {
 
 	// tg connection
 	client   *gotgproto.Client
+	api      *tg.Client // straight to the file's data centre where possible (apiFor)
 	location tg.InputFileLocationClass
 
 	// range stuff
@@ -65,6 +66,7 @@ func NewStreamPipe(
 	ctx context.Context,
 	client *gotgproto.Client,
 	location tg.InputFileLocationClass,
+	dc int,
 	start, end int64,
 	log *zap.Logger,
 ) (io.ReadCloser, error) {
@@ -83,6 +85,7 @@ func NewStreamPipe(
 		cancel:     cancel,
 		log:        log.Named("StreamPipe"),
 		client:     client,
+		api:        apiFor(ctx, client, dc, log),
 		location:   location,
 		start:      start,
 		end:        end,
@@ -214,7 +217,7 @@ func (p *StreamPipe) downloadBlockWithRetry(ctx context.Context, b blockSpec) ([
 // downloadBlock fetches a single block from Telegram.
 func (p *StreamPipe) downloadBlock(ctx context.Context, b blockSpec) ([]byte, error) {
 	p.log.Sugar().Debugf("Downloading block at offset %d (block size: %d)", b.offset, b.size)
-	res, err := p.client.API().UploadGetFile(ctx, &tg.UploadGetFileRequest{
+	res, err := p.api.UploadGetFile(ctx, &tg.UploadGetFileRequest{
 		Offset:   b.offset,
 		Limit:    int(b.size),
 		Location: p.location,
