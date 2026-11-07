@@ -49,10 +49,10 @@ func apiFor(ctx context.Context, client *gotgproto.Client, dc int, log *zap.Logg
 	defer cancel()
 	var invoker telegram.CloseInvoker
 	var err error
-	if dc == client.Config().ThisDC {
-		invoker, err = client.Pool(size)
+	if dc == client.Client.Config().ThisDC {
+		invoker, err = client.Client.Pool(size)
 	} else {
-		invoker, err = client.DC(openCtx, dc, size)
+		invoker, err = client.Client.DC(openCtx, dc, size)
 	}
 	if err != nil {
 		// Not kept: the next stream tries again.
