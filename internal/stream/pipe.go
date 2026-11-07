@@ -138,111 +138,34 @@ func (p *StreamPipe) Close() error {
 	return nil
 }
 
-// prefetch runs in a goroutine, fetching blocks concurrently and sending to blockQueue.
+// prefetch runs in a goroutine: the range's blocks are fetched up to STREAM_CONCURRENCY at once and
+// queued for Read in order, each as soon as it is in, small ones first (window.go).
 func (p *StreamPipe) prefetch() {
 	defer close(p.blockQueue)
 
-	// calc block boundaries
-	alignedStart := p.start - (p.start % p.blockSize)
-	leftTrim := p.start - alignedStart
-	rightTrim := (p.end % p.blockSize) + 1
-	totalBlocks := int((p.end - alignedStart + p.blockSize) / p.blockSize)
-
-	currentBlock := 0
-	offset := alignedStart
-
-	for currentBlock < totalBlocks {
-		// check for cancellation
-		select {
-		case <-p.ctx.Done():
-			return
-		default:
-		}
-
-		// fetch a batch of blocks concurrently
-		batchSize := min(config.ValueOf.StreamConcurrency, totalBlocks-currentBlock)
-		blocks := make([][]byte, batchSize)
-
-		var wg sync.WaitGroup
-		var fetchErr error
-		var errMu sync.Mutex
-
-		for i := range batchSize {
-			wg.Add(1)
-			go func(idx int) {
-				defer wg.Done()
-
-				blockNum := currentBlock + idx
-				blockOffset := offset + int64(idx)*p.blockSize
-
-				data, err := p.downloadBlockWithRetry(blockOffset)
-				dataLen := int64(len(data))
-
-				if err != nil {
-					errMu.Lock()
-					if fetchErr == nil {
-						fetchErr = err
-					}
-					errMu.Unlock()
-					return
-				}
-
-				// trim first/last block to exact range
-				if totalBlocks == 1 {
-					if dataLen < rightTrim {
-						rightTrim = dataLen
-					}
-					if leftTrim > dataLen {
-						leftTrim = dataLen
-					}
-					data = data[leftTrim:rightTrim]
-				} else if blockNum == 0 {
-					if leftTrim > dataLen {
-						leftTrim = dataLen
-					}
-					data = data[leftTrim:]
-				} else if blockNum == totalBlocks-1 {
-					if dataLen > rightTrim {
-						data = data[:rightTrim]
-					}
-				}
-
-				blocks[idx] = data
-			}(i)
-		}
-
-		wg.Wait()
-
-		// handle errors
-		// ignore context cancellation cuz it's expected on disconnect
-		if fetchErr != nil {
-			if p.ctx.Err() == nil {
-				p.log.Error("block download failed", zap.Error(fetchErr))
-			}
-			return
-		}
-
-		// send blocks to queue in order
-		for _, block := range blocks {
-			if block == nil {
-				// a fetch failure that wasn't captured, should not happen but just in case.
-				p.log.Error("unexpected nil block in batch, aborting prefetch")
-				return
+	blocks := planBlocks(p.start, p.end, p.blockSize)
+	err := fetchInOrder(p.ctx, blocks, config.ValueOf.StreamConcurrency,
+		p.downloadBlockWithRetry,
+		func(i int, data []byte) error {
+			part := trimBlock(blocks[i], data, p.start, p.end)
+			if len(part) == 0 {
+				return nil
 			}
 			select {
-			case p.blockQueue <- block:
+			case p.blockQueue <- part:
+				return nil
 			case <-p.ctx.Done():
-				return
+				return p.ctx.Err()
 			}
-		}
-
-		currentBlock += batchSize
-		offset += p.blockSize * int64(batchSize)
+		})
+	// ignore context cancellation cuz it's expected on disconnect
+	if err != nil && p.ctx.Err() == nil {
+		p.log.Error("block download failed", zap.Error(err))
 	}
 }
 
 // downloadBlockWithRetry fetches a block with exponential backoff retry.
-func (p *StreamPipe) downloadBlockWithRetry(offset int64) ([]byte, error) {
+func (p *StreamPipe) downloadBlockWithRetry(ctx context.Context, b blockSpec) ([]byte, error) {
 	var lastErr error
 
 	// TODO: make configurable later
@@ -251,13 +174,13 @@ func (p *StreamPipe) downloadBlockWithRetry(offset int64) ([]byte, error) {
 
 	for attempt := 0; attempt < config.ValueOf.StreamMaxRetries; attempt++ {
 		// check context before each attempt
-		if p.ctx.Err() != nil {
-			return nil, p.ctx.Err()
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
 		}
 
-		ctx, cancel := context.WithTimeout(p.ctx, time.Duration(config.ValueOf.StreamTimeoutSec)*time.Second)
+		attemptCtx, cancel := context.WithTimeout(ctx, time.Duration(config.ValueOf.StreamTimeoutSec)*time.Second)
 		data, err := utils.TimeFuncWithResult(p.log, "downloadBlock", func() ([]byte, error) {
-			return p.downloadBlock(ctx, offset)
+			return p.downloadBlock(attemptCtx, b)
 		})
 		cancel()
 
@@ -268,8 +191,8 @@ func (p *StreamPipe) downloadBlockWithRetry(offset int64) ([]byte, error) {
 		lastErr = err
 
 		// don't retry on context cancellation
-		if p.ctx.Err() != nil {
-			return nil, p.ctx.Err()
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
 		}
 
 		// exponential backoff
@@ -280,8 +203,8 @@ func (p *StreamPipe) downloadBlockWithRetry(offset int64) ([]byte, error) {
 			if backoff > maxBackoff {
 				backoff = maxBackoff
 			}
-		case <-p.ctx.Done():
-			return nil, p.ctx.Err()
+		case <-ctx.Done():
+			return nil, ctx.Err()
 		}
 	}
 
@@ -289,11 +212,11 @@ func (p *StreamPipe) downloadBlockWithRetry(offset int64) ([]byte, error) {
 }
 
 // downloadBlock fetches a single block from Telegram.
-func (p *StreamPipe) downloadBlock(ctx context.Context, offset int64) ([]byte, error) {
-	p.log.Sugar().Debugf("Downloading block at offset %d (block size: %d)", offset, p.blockSize)
+func (p *StreamPipe) downloadBlock(ctx context.Context, b blockSpec) ([]byte, error) {
+	p.log.Sugar().Debugf("Downloading block at offset %d (block size: %d)", b.offset, b.size)
 	res, err := p.client.API().UploadGetFile(ctx, &tg.UploadGetFileRequest{
-		Offset:   offset,
-		Limit:    int(p.blockSize),
+		Offset:   b.offset,
+		Limit:    int(b.size),
 		Location: p.location,
 	})
 
