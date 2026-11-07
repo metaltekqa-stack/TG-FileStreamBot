@@ -2,6 +2,7 @@ package commands
 
 import (
 	"fmt"
+	"path/filepath"
 	"strings"
 
 	"EverythingSuckz/fsb/config"
@@ -127,6 +128,16 @@ func sendLink(ctx *ext.Context, u *ext.Update) error {
 			reply = append(reply, styling.Plain("\n\nNot added to the library: "+err.Error()))
 		} else {
 			reply = append(reply, styling.Plain("\n\nAdded to the library as: "), styling.Bold(listed))
+			// With Jellyfin's address and key, Jellyfin is told straight away, so no scan is needed.
+			jellyfin := library.Jellyfin{URL: config.ValueOf.JellyfinURL, APIKey: config.ValueOf.JellyfinAPIKey}
+			if jellyfin.Enabled() {
+				if err := jellyfin.Added(filepath.Join(config.ValueOf.StrmDir, listed)); err != nil {
+					utils.Logger.Sugar().Error(err)
+					reply = append(reply, styling.Plain("\nJellyfin was not told, so scan the library: "+err.Error()))
+				} else {
+					reply = append(reply, styling.Plain("\nJellyfin lists it within a minute."))
+				}
+			}
 		}
 	}
 	if strings.Contains(link, "http://localhost") {
