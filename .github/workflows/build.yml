@@ -31,6 +31,7 @@ jobs:
           GOOS=darwin GOARCH=arm64 go build -trimpath -ldflags "-s -w" -o dist/mac-apple-silicon/fsb ./cmd/fsb
           GOOS=darwin GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o dist/mac-intel/fsb ./cmd/fsb
           GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o dist/linux-amd64/fsb ./cmd/fsb
+          GOOS=linux GOARCH=arm64 go build -trimpath -ldflags "-s -w" -o dist/linux-arm64/fsb ./cmd/fsb
           cp fsb.sample.env dist/
       - uses: actions/upload-artifact@v4
         with:
