@@ -82,6 +82,13 @@ func (w *BotWorkers) Add(token string) (err error) {
 	return nil
 }
 
+// All is every bot that started, the default one first.
+func (w *BotWorkers) All() []*Worker {
+	w.mut.Lock()
+	defer w.mut.Unlock()
+	return append([]*Worker(nil), w.Bots...)
+}
+
 func GetNextWorker() *Worker {
 	Workers.mut.Lock()
 	defer Workers.mut.Unlock()

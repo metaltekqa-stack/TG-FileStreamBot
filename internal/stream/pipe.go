@@ -34,15 +34,22 @@ func calculateBlockSize(start, end int64) int64 {
 
 // StreamPipe reads data from Telegram with concurrent prefetching. implements `io.ReadCloser`.
 // credits: [teldrive](https://github.com/tgdrive/teldrive/blob/1071a6e8b5a4076cacc5a0989ef245fae517d837/internal/reader/tg_reader.go)
+// Source is one bot's way to a file: the bot, the file's location as that bot sees it, and the
+// data centre it is stored in. A stream with several sources shares its blocks between the bots.
+type Source struct {
+	Client   *gotgproto.Client
+	Location tg.InputFileLocationClass
+	DC       int
+}
+
 type StreamPipe struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	log    *zap.Logger
 
 	// tg connection
-	client   *gotgproto.Client
-	api      *tg.Client // straight to the file's data centre where possible (apiFor)
-	location tg.InputFileLocationClass
+	sources []Source
+	turn    *rotation // which bot fetches the next block (rotation.go)
 
 	// range stuff
 	start      int64
@@ -65,15 +72,20 @@ type StreamPipe struct {
 // class function which creates a StreamPipe with default configuration.
 func NewStreamPipe(
 	ctx context.Context,
-	client *gotgproto.Client,
-	location tg.InputFileLocationClass,
-	dc int,
+	sources []Source,
 	start, end int64,
 	log *zap.Logger,
 ) (io.ReadCloser, error) {
 
 	if start > end {
 		return nil, fmt.Errorf("invalid range: start (%d) > end (%d)", start, end)
+	}
+	if len(sources) == 0 {
+		return nil, fmt.Errorf("no bot to fetch the file with")
+	}
+	keys := make([]any, len(sources))
+	for i, s := range sources {
+		keys[i] = s.Client
 	}
 
 	ctx, cancel := context.WithCancel(ctx)
@@ -85,9 +97,8 @@ func NewStreamPipe(
 		ctx:        ctx,
 		cancel:     cancel,
 		log:        log.Named("StreamPipe"),
-		client:     client,
-		api:        apiFor(ctx, client, dc, log),
-		location:   location,
+		sources:    sources,
+		turn:       newRotation(keys, botSlowdowns),
 		start:      start,
 		end:        end,
 		blockSize:  blockSize,
@@ -168,13 +179,19 @@ func (p *StreamPipe) prefetch() {
 	}
 }
 
-// maxFloodWait is how long one block may wait in all when Telegram asks to slow down.
-const maxFloodWait = 60 * time.Second
+// maxFloodWait is how long one block may wait in all when every bot has been asked to slow down,
+// and maxFloodAnswers how many slow down answers it takes before it gives up.
+const (
+	maxFloodWait    = 60 * time.Second
+	maxFloodAnswers = 30
+)
 
-// downloadBlockWithRetry fetches a block with exponential backoff retry. Telegram asking to slow
-// down (FLOOD_WAIT, FLOOD_PREMIUM_WAIT) is waited out as asked, without using up a try, so a stream
-// pauses instead of ending. The last try goes over the bot's own connection, in case the
-// connections to the file's data centre are the trouble.
+// downloadBlockWithRetry fetches a block, each try from the next bot in turn (rotation.go), with
+// exponential backoff retry. A bot that Telegram asks to slow down (FLOOD_WAIT,
+// FLOOD_PREMIUM_WAIT) is passed over until the time it gave while the other bots carry on, without
+// using up a try; only when all have been asked does the block wait, so a stream pauses instead of
+// ending. The last try goes over the bot's own connection, in case the connections to the file's
+// data centre are the trouble.
 func (p *StreamPipe) downloadBlockWithRetry(ctx context.Context, b blockSpec) ([]byte, error) {
 	var lastErr error
 
@@ -183,6 +200,7 @@ func (p *StreamPipe) downloadBlockWithRetry(ctx context.Context, b blockSpec) ([
 	const maxBackoff = 15 * time.Second // max backoff = 15s
 	retries := config.ValueOf.StreamMaxRetries
 	var floodWaited time.Duration
+	floodAnswers := 0
 
 	for attempt := 0; attempt < retries; {
 		// check context before each attempt
@@ -190,13 +208,28 @@ func (p *StreamPipe) downloadBlockWithRetry(ctx context.Context, b blockSpec) ([
 			return nil, ctx.Err()
 		}
 
-		api := p.api
+		i, wait := p.turn.pick(time.Now())
+		if wait > 0 {
+			if floodWaited+wait > maxFloodWait {
+				return nil, fmt.Errorf("telegram kept asking every bot to slow down: %w", lastErr)
+			}
+			floodWaited += wait
+			p.log.Info("Every bot was asked to slow down, waiting", zap.Duration("wait", wait), zap.Int64("offset", b.offset))
+			select {
+			case <-time.After(wait):
+				continue
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+		src := p.sources[i]
+		api := apiFor(ctx, src.Client, src.DC, p.log)
 		if retries > 1 && attempt == retries-1 {
-			api = p.client.API()
+			api = src.Client.API()
 		}
 		attemptCtx, cancel := context.WithTimeout(ctx, time.Duration(config.ValueOf.StreamTimeoutSec)*time.Second)
 		data, err := utils.TimeFuncWithResult(p.log, "downloadBlock", func() ([]byte, error) {
-			return p.downloadBlock(attemptCtx, api, b)
+			return p.downloadBlock(attemptCtx, api, src.Location, b)
 		})
 		cancel()
 
@@ -211,18 +244,14 @@ func (p *StreamPipe) downloadBlockWithRetry(ctx context.Context, b blockSpec) ([
 			return nil, ctx.Err()
 		}
 
-		if wait, ok := tgerr.AsFloodWait(err); ok && floodWaited+wait <= maxFloodWait {
-			floodWaited += wait
-			p.log.Info("Telegram asked to slow down, waiting", zap.Duration("wait", wait), zap.Int64("offset", b.offset))
-			select {
-			case <-time.After(wait + 200*time.Millisecond):
-				continue
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			}
+		if wait, ok := tgerr.AsFloodWait(err); ok && floodAnswers < maxFloodAnswers {
+			floodAnswers++
+			botSlowdowns.set(src.Client, time.Now().Add(wait+200*time.Millisecond))
+			p.log.Info("Telegram asked a bot to slow down", zap.Int("bot", i+1), zap.Duration("wait", wait), zap.Int64("offset", b.offset))
+			continue
 		}
 
-		p.log.Warn("Block download failed, retrying", zap.Int64("offset", b.offset), zap.Int("attempt", attempt+1), zap.Error(err))
+		p.log.Warn("Block download failed, retrying", zap.Int("bot", i+1), zap.Int64("offset", b.offset), zap.Int("attempt", attempt+1), zap.Error(err))
 		attempt++
 
 		// exponential backoff
@@ -242,12 +271,12 @@ func (p *StreamPipe) downloadBlockWithRetry(ctx context.Context, b blockSpec) ([
 }
 
 // downloadBlock fetches a single block from Telegram.
-func (p *StreamPipe) downloadBlock(ctx context.Context, api *tg.Client, b blockSpec) ([]byte, error) {
+func (p *StreamPipe) downloadBlock(ctx context.Context, api *tg.Client, location tg.InputFileLocationClass, b blockSpec) ([]byte, error) {
 	p.log.Sugar().Debugf("Downloading block at offset %d (block size: %d)", b.offset, b.size)
 	res, err := api.UploadGetFile(ctx, &tg.UploadGetFileRequest{
 		Offset:   b.offset,
 		Limit:    int(b.size),
-		Location: p.location,
+		Location: location,
 	})
 
 	if err != nil {

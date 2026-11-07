@@ -5,10 +5,13 @@ import (
 	"EverythingSuckz/fsb/internal/stream"
 	"EverythingSuckz/fsb/internal/types"
 	"EverythingSuckz/fsb/internal/utils"
+	"context"
 	"fmt"
 	"io"
 	"net/http"
 	"strconv"
+	"sync"
+	"time"
 
 	"github.com/gotd/td/tg"
 	range_parser "github.com/quantumsheep/range-parser"
@@ -127,7 +130,7 @@ func getStreamRoute(ctx *gin.Context) {
 	ctx.Header("Content-Disposition", fmt.Sprintf("%s; filename=\"%s\"", disposition, file.FileName))
 
 	if r.Method != "HEAD" {
-		pipe, err := stream.NewStreamPipe(ctx, worker.Client, file.Location, file.DCID, start, end, log)
+		pipe, err := stream.NewStreamPipe(ctx, streamSources(ctx, worker, file, messageID), start, end, log)
 		if err != nil {
 			log.Error("Failed to create stream pipe", zap.Error(err))
 			return
@@ -139,4 +142,43 @@ func getStreamRoute(ctx *gin.Context) {
 			}
 		}
 	}
+}
+
+// streamSources is every bot that can read the file, the one picked for this request first, so
+// the stream's blocks are shared between them (each bot has its own Telegram limits). A bot that
+// cannot read the file in time (not an admin of the channel, say) is left out. What each bot
+// finds is cached for an hour (FileFromMessage), so this costs Telegram calls on the first
+// request for a file only.
+func streamSources(ctx context.Context, first *bot.Worker, file *types.File, messageID int) []stream.Source {
+	sources := []stream.Source{{Client: first.Client, Location: file.Location, DC: file.DCID}}
+	all := bot.Workers.All()
+	if len(all) < 2 {
+		return sources
+	}
+	lookCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	found := make([]*stream.Source, len(all))
+	var wg sync.WaitGroup
+	for i, w := range all {
+		if w == nil || w.Client == nil || w.Client == first.Client {
+			continue
+		}
+		wg.Add(1)
+		go func(i int, w *bot.Worker) {
+			defer wg.Done()
+			f, err := utils.FileFromMessage(lookCtx, w.Client, messageID)
+			if err != nil || f.ID != file.ID {
+				log.Debug("A bot cannot read this file, leaving it out of the stream", zap.Int("worker", w.ID), zap.Error(err))
+				return
+			}
+			found[i] = &stream.Source{Client: w.Client, Location: f.Location, DC: f.DCID}
+		}(i, w)
+	}
+	wg.Wait()
+	for _, s := range found {
+		if s != nil {
+			sources = append(sources, *s)
+		}
+	}
+	return sources
 }
