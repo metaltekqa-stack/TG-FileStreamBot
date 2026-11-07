@@ -51,6 +51,21 @@ func getStreamRoute(ctx *gin.Context) {
 		return utils.FileFromMessage(ctx, worker.Client, messageID)
 	})
 	if err != nil {
+		// The bot picked for this request cannot read the file (not an admin of the log channel,
+		// say): another bot that can serves it, so one bot set up wrong does not break playback.
+		for _, other := range bot.Workers.All() {
+			if other == nil || other == worker || other.Client == nil {
+				continue
+			}
+			if f, otherErr := utils.FileFromMessage(ctx, other.Client, messageID); otherErr == nil {
+				log.Warn("A bot cannot read the file, so another one serves it: is it an admin of the log channel?",
+					zap.String("bot", botName(worker)), zap.Error(err))
+				worker, file, err = other, f, nil
+				break
+			}
+		}
+	}
+	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -168,7 +183,8 @@ func streamSources(ctx context.Context, first *bot.Worker, file *types.File, mes
 			defer wg.Done()
 			f, err := utils.FileFromMessage(lookCtx, w.Client, messageID)
 			if err != nil || f.ID != file.ID {
-				log.Debug("A bot cannot read this file, leaving it out of the stream", zap.Int("worker", w.ID), zap.Error(err))
+				log.Warn("A bot cannot read this file, leaving it out of the stream: is it an admin of the log channel?",
+					zap.String("bot", botName(w)), zap.Error(err))
 				return
 			}
 			found[i] = &stream.Source{Client: w.Client, Location: f.Location, DC: f.DCID}
@@ -181,4 +197,15 @@ func streamSources(ctx context.Context, first *bot.Worker, file *types.File, mes
 		}
 	}
 	return sources
+}
+
+// botName is a bot's @username for the log, or its worker number.
+func botName(w *bot.Worker) string {
+	if w != nil && w.Self != nil && w.Self.Username != "" {
+		return "@" + w.Self.Username
+	}
+	if w != nil {
+		return "worker " + strconv.Itoa(w.ID)
+	}
+	return "unknown"
 }
